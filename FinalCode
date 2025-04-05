@@ -1,0 +1,177 @@
+function turtlebotInspection()
+    clc; clear; close all;    
+    %% ===== Environment Setup =====
+    map = zeros(20, 20);    
+    % Boundary walls
+    map(1,:) = 1;
+    map(end,:) = 1;
+    map(:,1) = 1;
+    map(:,end) = 1;    
+    % Entry/exit points
+    map(1,5:7) = 0;
+    map(end,15:17) = 0;
+    map(10:12,1) = 0;
+    map(5:7,end) = 0;    
+    % Internal obstacles
+    map(3, 2:18) = 1;
+    map(6:18, 5) = 1;
+    map(10, 5:15) = 1;
+    map(15, 8:18) = 1;
+    map(8:15, 12) = 1;
+    map(5:12, 8) = 1;
+    map([4 7 12 17], [15 10 3 15]) = 1;
+    map(19, 5:8) = 1;    
+    startPos = [6, 3];
+    goalPos = [8, 6];
+    lidarRange = 5; % meters
+    resolution = 1; % cells per meter    
+    %% ===== Create State Space and Validator =====
+    bounds = [1 20; 1 20; -pi pi]; % [xmin xmax; ymin ymax; θmin θmax]
+    stateSpace = stateSpaceSE2(bounds);   
+    % Create state validator
+    validator = validatorOccupancyMap(stateSpace);
+    mapForPlanning = binaryOccupancyMap(map, resolution);
+    validator.Map = mapForPlanning;
+    validator.ValidationDistance = 0.1;    
+    %% ===== RRT Path Planning =====
+    planner = plannerRRT(stateSpace, validator);
+    planner.MaxConnectionDistance = 1.0;
+    planner.MaxIterations = 10000;
+    planner.GoalBias = 0.1;    
+    % Convert positions to state space format [x, y, theta]
+    startState = [startPos(2), startPos(1), 0];
+    goalState = [goalPos(2), goalPos(1), 0];    
+    % Plan path
+    rng(1, 'twister');
+    [pathObj, solutionInfo] = plan(planner, startState, goalState);
+    
+    if ~solutionInfo.IsPathFound
+        error('RRT failed to find a path!');
+    end 
+    pathStates = pathObj.States;
+    pathPositions = [pathStates(:,2), pathStates(:,1)]; % Convert to [row,col]   
+    %% ===== SLAM Initialization =====
+    slamAlg = lidarSLAM(resolution, lidarRange);
+    slamAlg.LoopClosureThreshold = 100;
+    slamAlg.LoopClosureSearchRadius = 2;    
+    % Create range sensor for SLAM
+    sensor = rangeSensor;
+    sensor.Range = [0 lidarRange];
+    sensor.HorizontalAngle = [-pi pi];
+    sensor.HorizontalAngleResolution = 0.1;    
+    %% ===== Visualization Setup =====
+    mainFig = figure('Position', [50 50 1200 500]);    
+    % Subplot 1: Warehouse Map with RRT
+    subplot(1,2,1);
+    show(mapForPlanning);
+    hold on;
+    scatter(startPos(2), startPos(1), 200, 'g', 'filled', 'DisplayName', 'Start');
+    scatter(goalPos(2), goalPos(1), 200, 'r', 'filled', 'DisplayName', 'Goal');
+    plot(solutionInfo.TreeData(:,1), solutionInfo.TreeData(:,2), 'k.', 'MarkerSize', 2);
+    plot(pathStates(:,1), pathStates(:,2), 'b-', 'LineWidth', 2, 'DisplayName', 'RRT Path');
+    title('Warehouse Map with RRT Path');
+    legend('Location', 'northeast');
+    axis equal tight;
+    grid on;
+    xlabel('X (m)'); ylabel('Y (m)');    
+    % Subplot 2: SLAM Map
+    subplot(1,2,2);
+    %slamAxes = gca;
+    title({'SLAM Map with Sensor View', '(Yellow=Robot, Red=Obstacles, Blue=Sensor View)'});
+    xlabel('X (m)'); ylabel('Y (m)');
+    axis equal tight;
+    grid on;    
+    %% ===== Main Navigation Loop =====
+    % Initialize variables for SLAM visualization
+    scanPoints = [];
+    scanLines = [];   
+    for step = 1:size(pathPositions,1)
+        currentPos = pathPositions(step,:);       
+        % Simulate lidar scan at current position
+        ranges = sensor([currentPos(2)-0.5, currentPos(1)-0.5, 0], mapForPlanning);
+        angles = linspace(-pi, pi, numel(ranges));        
+        % Update SLAM
+        [isScanAccepted, loopClosureInfo, optimizationInfo] = ...
+            addScan(slamAlg, lidarScan(ranges, angles));        
+        % Get scan points for visualization
+        [scanPoints, scanLines] = getScanPoints(currentPos, ranges, angles, lidarRange);        
+        % Visualize
+        visualizeNavigation(currentPos, pathPositions, mapForPlanning, slamAlg, ...
+                          mainFig, scanPoints, scanLines);       
+        pause(0.1);   
+        % Check if goal reached
+        if norm(currentPos - goalPos) < 0.5
+            break;
+        end
+    end    
+    %% ===== Final Visualization =====
+    showFinalResults(mapForPlanning, startPos, goalPos, pathPositions, slamAlg);
+end
+function [scanPoints, scanLines] = getScanPoints(pos, ranges, angles, maxRange)
+    scanPoints = [];
+    scanLines = [];
+    
+    for i = 1:length(ranges)
+        r = ranges(i);
+        theta = angles(i);
+        
+        if r < maxRange
+            x = pos(1) + r * sin(theta);
+            y = pos(2) + r * cos(theta);
+            scanPoints = [scanPoints; x y];
+            scanLines = [scanLines; pos(1) pos(2); x y; NaN NaN];
+        else
+            x = pos(1) + maxRange * sin(theta);
+            y = pos(2) + maxRange * cos(theta);
+            scanPoints = [scanPoints; x y];
+            scanLines = [scanLines; pos(1) pos(2); x y; NaN NaN];
+        end
+    end
+end
+function visualizeNavigation(currentPos, path, map, slamAlg, fig, scanPoints, scanLines)
+    figure(fig);  
+    % Subplot 1: Warehouse Map
+    subplot(1,2,1);
+    cla;
+    show(map);
+    hold on;
+    scatter(path(1,2), path(1,1), 200, 'g', 'filled');
+    scatter(path(end,2), path(end,1), 200, 'r', 'filled');
+    plot(path(:,2), path(:,1), 'b-', 'LineWidth', 2);
+    scatter(currentPos(2), currentPos(1), 150, 'y', 'filled');
+    title('Warehouse Map with Planned Path');   
+    % Subplot 2: SLAM Map
+    subplot(1,2,2);
+    cla;
+    show(slamAlg);
+    hold on;    
+    % Plot scan points and lines
+    if ~isempty(scanPoints)
+        scatter(scanPoints(:,2), scanPoints(:,1), 20, 'r', 'filled');
+    end
+    if ~isempty(scanLines)
+        plot(scanLines(:,2), scanLines(:,1), 'b-', 'LineWidth', 0.5);
+    end    
+    scatter(currentPos(2), currentPos(1), 150, 'y', 'filled');
+    title('SLAM Map with Sensor View');
+end
+function showFinalResults(map, startPos, goalPos, path, slamAlg)
+    % Calculate battery usage
+    distTraveled = sum(sqrt(sum(diff(path).^2,2)));
+    batteryCapacity = 100; % %
+    batteryUsed = min(distTraveled * 0.5, batteryCapacity);
+    batteryRemaining = batteryCapacity - batteryUsed;    
+    % Final position figure
+    figure('Position', [800 200 600 600], 'Name', 'Final Position');
+    show(map);
+    hold on;
+    plot(path(:,2), path(:,1), 'b-', 'LineWidth', 2);
+    scatter(path(end,2), path(end,1), 300, 'y', 'filled', 'MarkerEdgeColor', 'k');
+    scatter(startPos(2), startPos(1), 200, 'g', 'filled');
+    scatter(goalPos(2), goalPos(1), 200, 'r', 'filled');
+    title({'Final Robot Position', sprintf('Battery Remaining: %.1f%%', batteryRemaining)});
+    % SLAM results figure
+    figure('Name', 'SLAM Results');
+    show(slamAlg);
+    title('Final SLAM Map with Optimized Poses');
+end
